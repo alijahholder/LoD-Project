@@ -1,0 +1,407 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------- Auth & Users ----------------
+
+model User {
+  id              String         @id @default(cuid())
+  email           String         @unique
+  emailVerifiedAt DateTime?
+  name            String?
+  passwordHash    String?
+  role            String         @default("player") // player | admin
+  totpSecret      String? // encrypted TOTP secret (PHI envelope)
+  mfaEnrolledAt   DateTime?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+  lastLoginAt     DateTime?
+
+  playerProfile   PlayerProfile?
+  sessions        Session[]
+  auditLogs       AuditLog[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// ---------------- Player ----------------
+
+model PlayerProfile {
+  id                    String         @id @default(cuid())
+  userId                String         @unique
+  user                  User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  legalFirstName        String
+  legalLastName         String
+  preferredName         String?
+  dateOfBirth           DateTime
+  ssnLast4Encrypted     String? // envelope-encrypted
+  phoneEncrypted        String?
+  addressEncrypted      String?
+
+  position              String?
+  creditedSeasons       Int            @default(0)
+  lastActivePlayerDate  DateTime?
+  // computed: lodFilingDeadline = max(48 months, creditedSeasons years) from lastActivePlayerDate
+  lodFilingDeadline     DateTime?
+
+  onboardingCompletedAt DateTime?
+  createdAt             DateTime       @default(now())
+  updatedAt             DateTime       @updatedAt
+
+  teamHistory           TeamStint[]
+  claims                Claim[]
+  offsets               OffsetRecord[]
+}
+
+model TeamStint {
+  id        String   @id @default(cuid())
+  profileId String
+  profile   PlayerProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  team      String
+  startYear Int
+  endYear   Int
+  notes     String?
+
+  @@index([profileId])
+}
+
+// ---------------- Rubric (versioned, admin-editable) ----------------
+
+model RubricVersion {
+  id            String              @id @default(cuid())
+  name          String // e.g. "Appendix A v2"
+  benefit       String // e.g. "LOD"
+  effectiveFrom DateTime            @default(now())
+  publishedById String?
+  isActive      Boolean             @default(false)
+  notes         String?
+  createdAt     DateTime            @default(now())
+
+  categories    ImpairmentCategory[]
+  claims        Claim[]
+}
+
+model ImpairmentCategory {
+  id                   String         @id @default(cuid())
+  rubricVersionId      String
+  rubricVersion        RubricVersion  @relation(fields: [rubricVersionId], references: [id], onDelete: Cascade)
+  code                 String // e.g. "ORTHO-KNEE-ACL"
+  bodyRegion           String // e.g. "knee"
+  title                String
+  description          String
+  points               Int
+  evidenceRequirements String // JSON array of strings
+  excludedFromLOD      Boolean        @default(false)
+  // pathway: orthopedic | speech_sight | hearing | vital_organ_cns
+  pathway              String         @default("orthopedic")
+  sortOrder            Int            @default(0)
+
+  findings             ImpairmentFinding[]
+
+  @@unique([rubricVersionId, code])
+  @@index([rubricVersionId])
+}
+
+// ---------------- Claim ----------------
+
+model Claim {
+  id                   String              @id @default(cuid())
+  profileId            String
+  profile              PlayerProfile       @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  benefitType          String              @default("LOD")
+  rubricVersionId      String?
+  rubricVersion        RubricVersion?      @relation(fields: [rubricVersionId], references: [id])
+  status               String              @default("draft")
+  // draft | screening | building | submitted | completeness | under_review | decided | denied | appealed | awarded | withdrawn
+
+  filingDeadline       DateTime?
+  filedAt              DateTime?
+  completenessClockEnd DateTime? // 45 days after filed
+  decidedAt            DateTime?
+  deniedAt             DateTime?
+  appealDeadline       DateTime? // deniedAt + 180d
+  awardedAt            DateTime?
+
+  prescreenAnswers     String? // JSON
+  notes                String?
+
+  createdAt            DateTime            @default(now())
+  updatedAt            DateTime            @updatedAt
+
+  documents            Document[]
+  findings             ImpairmentFinding[]
+  recordRequests       MedicalRecordRequest[]
+  timeline             TimelineEvent[]
+  appeals              Appeal[]
+  submissions          Submission[]
+  payments             Payment[]
+  neutralExams         NeutralPhysicianExam[]
+
+  @@index([profileId])
+}
+
+model Document {
+  id              String              @id @default(cuid())
+  claimId         String
+  claim           Claim               @relation(fields: [claimId], references: [id], onDelete: Cascade)
+  source          String // player_upload | nfl_club | third_party_provider | plan_correspondence | denial_letter
+  providerName    String?
+  filename        String
+  mimeType        String
+  byteSize        Int
+  storageKey      String
+  sha256          String
+  pageCount       Int                 @default(0)
+  ocrStatus       String              @default("pending") // pending | running | done | failed
+  ocrText         String? // concatenated OCR
+  ocrJson         String? // page-level w/ bboxes (JSON)
+  uploadedAt      DateTime            @default(now())
+
+  extractions     DocumentExtraction[]
+  releaseFor      MedicalRecordRequest[] @relation("ReleaseDoc")
+
+  @@index([claimId])
+}
+
+model DocumentExtraction {
+  id            String   @id @default(cuid())
+  documentId    String
+  document      Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  modelVersion  String
+  findingsJson  String // raw structured JSON
+  createdAt     DateTime @default(now())
+
+  @@index([documentId])
+}
+
+model ImpairmentFinding {
+  id              String              @id @default(cuid())
+  claimId         String
+  claim           Claim               @relation(fields: [claimId], references: [id], onDelete: Cascade)
+  categoryId      String
+  category        ImpairmentCategory  @relation(fields: [categoryId], references: [id])
+
+  status          String              @default("suggested") // suggested | confirmed | rejected | edited
+  points          Int
+  confidence      Float               @default(0)
+  rationale       String? // plain-language why
+  citationsJson   String // [{documentId, page, bbox?, snippet}]
+  playerNotes     String?
+  reviewedAt      DateTime?
+  reviewedBy      String?
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+
+  @@index([claimId])
+  @@index([categoryId])
+}
+
+// ---------------- Medical Records Request Tracking ----------------
+
+model MedicalRecordRequest {
+  id                String     @id @default(cuid())
+  claimId           String
+  claim             Claim      @relation(fields: [claimId], references: [id], onDelete: Cascade)
+  providerType      String // nfl_club | third_party
+  providerName      String
+  providerContact   String? // phone/email/address
+  dateRangeStart    DateTime?
+  dateRangeEnd      DateTime?
+  method            String? // mail | fax | portal | email
+  sentAt            DateTime?
+  expectedBy        DateTime?
+  status            String     @default("drafted") // drafted | sent | partial | complete | denied | escalated
+  releaseDocumentId String?
+  releaseDoc        Document?  @relation("ReleaseDoc", fields: [releaseDocumentId], references: [id])
+  notes             String?
+  createdAt         DateTime   @default(now())
+  updatedAt         DateTime   @updatedAt
+
+  followUps         FollowUp[]
+
+  @@index([claimId])
+}
+
+model FollowUp {
+  id        String   @id @default(cuid())
+  requestId String
+  request   MedicalRecordRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  dueAt     DateTime
+  channel   String // call | email | mail | fax
+  outcome   String? // no_answer | promised | sent | refused | needs_release
+  notes     String?
+  completedAt DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([requestId])
+}
+
+// ---------------- Timeline & Submissions (ERISA admin record) ----------------
+
+model TimelineEvent {
+  id        String   @id @default(cuid())
+  claimId   String
+  claim     Claim    @relation(fields: [claimId], references: [id], onDelete: Cascade)
+  type      String // status_change | submission | denial | appeal_filed | exam_scheduled | follow_up | note
+  occurredAt DateTime @default(now())
+  actor     String? // userId or "system"
+  payload   String // JSON
+  payloadHash String
+
+  @@index([claimId, occurredAt])
+}
+
+model Submission {
+  id            String   @id @default(cuid())
+  claimId       String
+  claim         Claim    @relation(fields: [claimId], references: [id], onDelete: Cascade)
+  kind          String // initial_application | additional_records | appeal | other
+  storageKey    String // immutable zip
+  manifestJson  String // file list + hashes
+  manifestHash  String // sha256 over manifestJson
+  signedAt      DateTime?
+  signerName    String?
+  filedAt       DateTime @default(now())
+
+  @@index([claimId])
+}
+
+// ---------------- Appeals ----------------
+
+model Appeal {
+  id              String        @id @default(cuid())
+  claimId         String
+  claim           Claim         @relation(fields: [claimId], references: [id], onDelete: Cascade)
+  filedAt         DateTime?
+  appealDeadline  DateTime
+  hearingDate     DateTime?
+  hearingType     String? // IPB | MAB | other
+  status          String        @default("preparing") // preparing | filed | hearing_scheduled | decided | withdrawn
+  briefMarkdown   String?
+  themesJson      String? // JSON array
+  exhibitsJson    String? // JSON array of exhibit refs
+  witnessPlanJson String?
+  mockQAJson      String?
+  decisionAt      DateTime?
+  decisionOutcome String?
+  decisionMemo    String?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@index([claimId])
+}
+
+// ---------------- Neutral Physician Exams ----------------
+
+model NeutralPhysicianExam {
+  id              String   @id @default(cuid())
+  claimId         String
+  claim           Claim    @relation(fields: [claimId], references: [id], onDelete: Cascade)
+  physicianName   String?
+  specialty       String?
+  scheduledFor    DateTime?
+  location        String?
+  prepChecklistJson String? // JSON of checklist items + done flags
+  postNotes       String?
+  inadequate      Boolean  @default(false)
+  supplementalLetterMd String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([claimId])
+}
+
+// ---------------- Offsets & Payments ----------------
+
+model OffsetRecord {
+  id            String   @id @default(cuid())
+  profileId     String
+  profile       PlayerProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  source        String // SSDI | WC | other
+  monthlyAmount Float
+  effectiveFrom DateTime
+  effectiveTo   DateTime?
+  notes         String?
+
+  @@index([profileId])
+}
+
+model Payment {
+  id            String   @id @default(cuid())
+  claimId       String
+  claim         Claim    @relation(fields: [claimId], references: [id], onDelete: Cascade)
+  periodStart   DateTime
+  periodEnd     DateTime
+  gross         Float
+  offsetTotal   Float
+  net           Float
+  paidAt        DateTime?
+  notes         String?
+
+  @@index([claimId])
+}
+
+// ---------------- Audit Log (append-only PHI access ledger) ----------------
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  userId      String?
+  user        User?    @relation(fields: [userId], references: [id])
+  action      String // e.g. "document.read", "phi.export", "claim.submit"
+  entityType  String?
+  entityId    String?
+  ip          String?
+  userAgent   String?
+  metadata    String? // JSON
+  occurredAt  DateTime @default(now())
+  prevHash    String? // chain to previous entry for tamper-evidence
+  hash        String
+
+  @@index([userId, occurredAt])
+  @@index([entityType, entityId])
+}
+
+// ---------------- Templates (HIPAA releases, denial parser fixtures, etc.) ----------------
+
+model Template {
+  id        String   @id @default(cuid())
+  kind      String // hipaa_release_nfl_club | hipaa_release_third_party | appeal_brief | etc.
+  name      String
+  body      String // markdown w/ {{slots}}
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ---------------- Reminders ----------------
+
+model Reminder {
+  id          String   @id @default(cuid())
+  userId      String
+  entityType  String // claim | followup | exam | deadline
+  entityId    String
+  dueAt       DateTime
+  channel     String // email | sms | inapp
+  sentAt      DateTime?
+  status      String   @default("scheduled") // scheduled | sent | failed | canceled
+  body        String
+  subject     String?
+
+  @@index([userId, dueAt])
+  @@index([status, dueAt])
+}
