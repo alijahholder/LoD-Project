@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
-import { Input, Label, Select, Textarea } from "@/components/ui/input";
+import { Input, Select, Textarea } from "@/components/ui/input";
 import { Plus, Trash2, ShieldCheck } from "lucide-react";
 import { Callout } from "@/components/ui/callout";
 
